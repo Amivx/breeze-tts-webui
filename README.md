@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>❗ 纯 AI 产物，有需求建议去原版仓库</h1>
+  <h1>❗纯AI产物，有需求建议去原版仓库</h1>
   <p><b>本仓库是 <a href="https://github.com/breezeblue-ai/breeze-tts">breezeblue-ai/breeze-tts</a> 的第三方本地化分支，
   仅额外增加网页控制台与音色库（<code>webui/</code>），上游代码未作修改。<br>
   功能建议、问题反馈与模型相关的疑问，请优先前往原版仓库或 <a href="https://huggingface.co/BreezeBlue/breeze-tts-2">官方模型页</a>；
