@@ -1,0 +1,25 @@
+runs/
+outputs/
+warmup_manifest.json
+*.wav
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.env
+.env.*
+
+# ---- local deployment artifacts (not part of the repository) ----
+.venv/
+venv/
+checkpoints/
+voices/
+_setup/
+部署说明.md
