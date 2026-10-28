@@ -9,6 +9,14 @@
     - DELETE /api/voices/{id}    -> 删除音色
     - GET  /api/voices/{id}/ref  -> 取回音色的参考音频
     - GET  /api/voices/{id}/sample -> 取回音色的试听样本
+    - POST /api/log              -> 记录一次生成（写入本次会话日志 + manifest + 归档音频）
+    - GET  /api/history          -> 读取历史生成记录（本次会话 + 之前会话）
+    - GET  /api/history/{id}/wav -> 取回归档的音频
+    - GET  /api/history/{id}/ref -> 取回归档的参考音频
+    - GET  /api/session          -> 当前会话 id 与日志路径
+
+每个进程启动都会新建 ``logs/session_<时间戳>.log``，所有生成流水都会追加进去，
+同时写一条机器可读的 ``logs/manifest.jsonl``，音频归档在 ``outputs/gen/``。
 
 用法：
     .venv\\Scripts\\python.exe -m webui.server checkpoints\\Breeze-TTS-2 --port 7860
@@ -17,10 +25,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import secrets
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,11 +45,71 @@ WEBUI_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = WEBUI_DIR.parent
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 VOICES_DIR = PROJECT_ROOT / "voices"
+LOGS_DIR = PROJECT_ROOT / "logs"
+GEN_DIR = OUTPUTS_DIR / "gen"
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._\-\u4e00-\u9fff]{1,120}$")
 _SAFE_ID = re.compile(r"^v_[0-9a-f]{12}$")
+_SAFE_GEN = re.compile(r"^g_[0-9a-f]{12}$")
 MAX_SAVE_BYTES = 64 * 1024 * 1024
 MAX_VOICE_NOTE = 2000
+MAX_LOG_TEXT = 8000
+MAX_HISTORY = 500
+
+# 每次启动生成一个独立的会话日志，方便事后追溯
+SESSION_ID = time.strftime("%Y-%m-%d_%H%M%S")
+SESSION_LOG = LOGS_DIR / f"session_{SESSION_ID}.log"
+MANIFEST = LOGS_DIR / "manifest.jsonl"
+_log_lock = threading.Lock()
+
+
+def slog(msg: str) -> None:
+    """往本次会话日志追加一行（同时打到控制台）。"""
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        with _log_lock:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            with SESSION_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except Exception:
+        pass
+    print(line, flush=True)
+
+
+def _append_manifest(record: dict) -> None:
+    with _log_lock:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with MANIFEST.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _read_manifest() -> list[dict]:
+    if not MANIFEST.is_file():
+        return []
+    items: list[dict] = []
+    try:
+        with MANIFEST.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return items
+
+
+def _gen_path(gid: str, suffix: str) -> Path:
+    if not _SAFE_GEN.match(gid):
+        raise HTTPException(status_code=400, detail="非法的记录 id")
+    path = GEN_DIR / f"{gid}{suffix}"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="归档文件不存在")
+    return path
+
 
 
 @app.get("/", include_in_schema=False)
@@ -202,6 +272,146 @@ def get_voice_sample(vid: str) -> FileResponse:
     return FileResponse(path, media_type="audio/wav")
 
 
+@app.get("/api/session", include_in_schema=False)
+def get_session() -> JSONResponse:
+    """当前进程的会话信息，前端启动时拉一次用于显示。"""
+    return JSONResponse({
+        "session": SESSION_ID,
+        "log": str(SESSION_LOG),
+        "manifest": str(MANIFEST),
+        "archive": str(GEN_DIR),
+    })
+
+
+@app.post("/api/log", include_in_schema=False)
+async def log_generation(request: Request) -> JSONResponse:
+    """记录一次生成。
+
+    multipart 字段（全部可选，除 text/texts 至少一个）：
+        mode / endpoint / locked / batch / text / texts / instruction /
+        cfg / seed / refName / refText / ttfa / total / dur / sampleRate /
+        voice / ok / error
+    文件字段：
+        wav  本次生成的 WAV（归档到 outputs/gen/）
+        ref  本次使用的参考音频（归档，便于以后原样重放）
+    """
+    form = await request.form()
+    gid = "g_" + secrets.token_hex(6)
+    GEN_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _f(key: str, default: float = 0.0) -> float:
+        try:
+            return float(form.get(key) or default)
+        except Exception:
+            return default
+
+    def _b(key: str) -> bool:
+        return str(form.get(key) or "").lower() in ("1", "true", "yes", "on")
+
+    wav_sha = None
+    wav_bytes = 0
+    wav_file = form.get("wav")
+    if wav_file is not None and hasattr(wav_file, "read"):
+        payload = await wav_file.read()
+        if payload:
+            if len(payload) > MAX_SAVE_BYTES:
+                raise HTTPException(status_code=413, detail="音频过大（上限 64 MB）")
+            (GEN_DIR / f"{gid}.wav").write_bytes(payload)
+            wav_sha = hashlib.sha256(payload).hexdigest()
+            wav_bytes = len(payload)
+
+    has_ref = False
+    ref_file = form.get("ref")
+    if ref_file is not None and hasattr(ref_file, "read"):
+        payload = await ref_file.read()
+        if payload:
+            if len(payload) > MAX_SAVE_BYTES:
+                raise HTTPException(status_code=413, detail="参考音频过大（上限 64 MB）")
+            (GEN_DIR / f"{gid}_ref.wav").write_bytes(payload)
+            has_ref = True
+
+    texts_raw = str(form.get("texts") or "").strip()
+    texts: list[str] = []
+    if texts_raw:
+        try:
+            parsed = json.loads(texts_raw)
+            if isinstance(parsed, list):
+                texts = [str(x) for x in parsed]
+        except Exception:
+            texts = [texts_raw]
+
+    dur = _f("dur")
+    total = _f("total")
+    record = {
+        "id": gid,
+        "session": SESSION_ID,
+        "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": str(form.get("mode") or "design"),
+        "endpoint": str(form.get("endpoint") or "/v1/audio/speech"),
+        "locked": _b("locked"),
+        "batch": _b("batch"),
+        "ok": str(form.get("ok") or "1").lower() not in ("0", "false"),
+        "error": str(form.get("error") or ""),
+        "text": str(form.get("text") or "")[:MAX_LOG_TEXT],
+        "texts": [t[:MAX_LOG_TEXT] for t in texts],
+        "instruction": str(form.get("instruction") or "")[:MAX_LOG_TEXT],
+        "cfg": _f("cfg", 1.0),
+        "seed": int(_f("seed", 42)),
+        "refName": str(form.get("refName") or ""),
+        "refText": str(form.get("refText") or "")[:MAX_LOG_TEXT],
+        "voice": str(form.get("voice") or ""),
+        "ttfa": _f("ttfa", -1) if str(form.get("ttfa") or "") != "" else None,
+        "total": total,
+        "dur": dur,
+        "rtf": round(total / 1000.0 / dur, 3) if dur > 0 else None,
+        "sampleRate": int(_f("sampleRate", 24000)),
+        "wavSha256": wav_sha,
+        "wavBytes": wav_bytes,
+        "hasWav": wav_sha is not None,
+        "hasRef": has_ref,
+    }
+    _append_manifest(record)
+
+    tag = "可复现" if record["locked"] else "流式"
+    slog(
+        f"生成 {gid} · {record['mode']} · {tag} · seed={record['seed']} "
+        f"cfg={record['cfg']} · {dur:.2f}s 音频 · 用时 {total / 1000:.2f}s "
+        f"· sha256={(wav_sha or '-')[:16]}"
+    )
+    if record["text"]:
+        slog(f"  文本: {record['text'][:120]}")
+    if record["instruction"]:
+        slog(f"  音色: {record['instruction'][:120]}")
+    if record["refName"]:
+        slog(f"  参考: {record['refName']} · 文本「{record['refText'][:60]}」")
+
+    return JSONResponse({"id": gid, "record": record})
+
+
+@app.get("/api/history", include_in_schema=False)
+def get_history(limit: int = 200, session: str | None = None) -> JSONResponse:
+    """历史生成记录，新的在前。
+
+    session 传具体值可只看某一次会话；默认返回全部（跨会话）。
+    """
+    items = _read_manifest()
+    if session:
+        items = [x for x in items if x.get("session") == session]
+    items = items[-max(1, min(limit, MAX_HISTORY)):]
+    items.reverse()
+    return JSONResponse({"items": items, "session": SESSION_ID})
+
+
+@app.get("/api/history/{gid}/wav", include_in_schema=False)
+def get_history_wav(gid: str) -> FileResponse:
+    return FileResponse(_gen_path(gid, ".wav"), media_type="audio/wav")
+
+
+@app.get("/api/history/{gid}/ref", include_in_schema=False)
+def get_history_ref(gid: str) -> FileResponse:
+    return FileResponse(_gen_path(gid, "_ref.wav"), media_type="audio/wav")
+
+
 app.mount("/webui", StaticFiles(directory=str(WEBUI_DIR)), name="webui")
 
 
@@ -242,9 +452,23 @@ def main() -> None:
     print(f"  文档  http://{args.host}:{args.port}/docs", flush=True)
     print("=" * 62, flush=True)
 
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    GEN_DIR.mkdir(parents=True, exist_ok=True)
+    slog("=" * 58)
+    slog(f"会话开始 {SESSION_ID}")
+    slog(f"模型   {model_dir}")
+    slog(f"监听   http://{args.host}:{args.port}/")
+    slog(f"日志   {SESSION_LOG}")
+    slog("=" * 58)
+
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        slog(f"会话结束 {SESSION_ID}")
 
 
 if __name__ == "__main__":

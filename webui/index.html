@@ -168,6 +168,7 @@
     border:1px solid transparent;transition:.15s;
   }
   .hist-item:hover{background:var(--panel2);border-color:var(--line)}
+  .hist-item.on{background:var(--panel2);border-color:var(--accent2)}
   .hist-item .txt{flex:1;min-width:0}
   .hist-item .txt .t{
     font-size:13px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;
@@ -406,6 +407,22 @@
       <div class="hist" id="history">
         <div class="hint" style="padding:8px">还没有生成记录。按 <kbd>Ctrl+Enter</kbd> 或点击左侧按钮开始。</div>
       </div>
+      <div class="hint" style="margin-top:8px">
+        本次页面内的记录（含音频，可离线重放）。刷新后会转到下面的「服务端记录」。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>服务端记录 <span class="badge" id="srv-badge">0</span>
+        <span class="spacer"></span>
+        <button class="sm ghost" id="btn-srv-refresh" title="重新读取 logs\manifest.jsonl">刷新</button>
+      </h2>
+      <div class="hist" id="srv-history">
+        <div class="hint" style="padding:8px">每次生成都会落盘到 logs\ 目录，刷新页面、重启服务后仍然能查到并还原参数。</div>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        🔒 确定性（逐字节可复现） · 〰 流式 · ▶ 播放归档 · ↺ 还原参数 · ⧉ 复制 curl · ⬇ 下载
+      </div>
     </div>
 
     <div class="card">
@@ -436,6 +453,7 @@ const state = {
   nextTime: 0,
   playing: false,
   playingStartCtx: 0,
+  playT0: null,        // 波形进度高亮的播放起点（AudioContext 时间）
   abort: null,
   busy: false,
   buffer: null,        // Float32Array，当前生成的完整音频
@@ -449,6 +467,8 @@ const state = {
   lock: false,         // 确定性复刻（走 /batch）
   voices: [],
   currentVoice: null,  // 当前选中的音色 id
+  serverHistory: [],   // 服务端记录（logs\manifest.jsonl）
+  serverSession: "",
 };
 
 function toast(msg, kind = "") {
@@ -523,6 +543,7 @@ function audioCtx() {
 }
 
 function resetPlayback() {
+  stopPlayhead();
   const ctx = state.ctx;
   if (ctx) {
     state.sources.forEach((s) => { try { s.stop(); } catch (e) {} });
@@ -531,6 +552,7 @@ function resetPlayback() {
     state.playingStartCtx = ctx.currentTime;
     state.playing = false;
   }
+  state.playT0 = null;
 }
 
 function scheduleChunk(f32, sampleRate) {
@@ -543,6 +565,8 @@ function scheduleChunk(f32, sampleRate) {
   src.connect(state.gain);
   const now = ctx.currentTime;
   if (state.nextTime < now + 0.06) state.nextTime = now + 0.06;
+  // 第一块进来时锚定播放起点，供波形进度高亮用
+  if (state.playT0 == null) state.playT0 = state.nextTime;
   src.start(state.nextTime);
   state.nextTime += ab.duration;
   state.playing = true;
@@ -551,6 +575,7 @@ function scheduleChunk(f32, sampleRate) {
     state.sources = state.sources.filter((x) => x !== src);
     if (state.sources.length === 0) state.playing = false;
   };
+  if (!playRaf) startPlayhead(streamProgress);
 }
 
 /* ============================================================
@@ -587,7 +612,9 @@ function drawWave(samples, highlightUpto) {
   const upto = highlightUpto == null ? w : Math.round((highlightUpto / samples.length) * w);
 
   for (let x = 0; x < w; x++) {
-    const a = Math.floor(x * per), b = Math.min(samples.length, Math.floor((x + 1) * per));
+    const a = Math.min(samples.length - 1, Math.floor(x * per));
+    // 短音频（采样数 < 画布宽度）时 per<1，若直接 floor 会出现 a==b 的空列，波形变虚线
+    const b = Math.max(a + 1, Math.min(samples.length, Math.floor((x + 1) * per)));
     let mn = 1, mx = -1;
     for (let i = a; i < b; i++) {
       const v = samples[i];
@@ -595,12 +622,57 @@ function drawWave(samples, highlightUpto) {
       if (v > mx) mx = v;
     }
     if (mn > mx) { mn = 0; mx = 0; }
-    g.strokeStyle = x < upto ? "#3ba7ff" : "#2c4a66";
+    g.strokeStyle = x < upto ? "#4db4ff" : "#2c4a66";
+    g.lineWidth = x < upto ? 1.4 : 1;
     g.beginPath();
     g.moveTo(x + 0.5, mid - mx * amp);
     g.lineTo(x + 0.5, mid - mn * amp + 1);
     g.stroke();
   }
+}
+
+/* 播放进度高亮：之前 drawWave 的第二个参数从来没被传过，所以波形永远只有静态色。
+   这里用 requestAnimationFrame 推进，每帧把「已播采样数」交给 drawWave。
+   getProgress 返回 0~1 的播放进度；返回负数表示已经停下。 */
+let playRaf = null;
+
+function stopPlayhead() {
+  if (playRaf) { cancelAnimationFrame(playRaf); playRaf = null; }
+}
+
+/* fallbackSec：getProgress 还取不到有效进度时的兜底时长（秒）。
+   <audio> 刚 play() 的那几帧 duration 还是 NaN，若不兜底就会被判成 -1 直接退出，
+   于是高亮一帧都不动——这正是之前"波形动画没了"的第二个原因。 */
+function startPlayhead(getProgress, fallbackSec) {
+  stopPlayhead();
+  const t0 = performance.now();
+  const tick = () => {
+    if (!state.buffer || !state.buffer.length) { playRaf = null; return; }
+    let p = getProgress();
+    if (!(p >= 0)) {
+      if (fallbackSec > 0) p = (performance.now() - t0) / 1000 / fallbackSec;
+      if (!(p >= 0)) { playRaf = null; return; }
+    }
+    if (p >= 0.999) {
+      drawWave(state.buffer);
+      state.playT0 = null;
+      playRaf = null;
+      return;
+    }
+    drawWave(state.buffer, Math.floor(p * state.buffer.length));
+    playRaf = requestAnimationFrame(tick);
+  };
+  playRaf = requestAnimationFrame(tick);
+}
+
+/* 流式播放时按 AudioContext 时钟推进 */
+function streamProgress() {
+  const ctx = state.ctx;
+  if (!ctx || state.playT0 == null || !state.buffer || !state.buffer.length) return -1;
+  const elapsed = Math.max(0, ctx.currentTime - state.playT0);
+  const total = state.buffer.length / state.sampleRate;
+  if (!total) return -1;
+  return elapsed / total;
 }
 
 let waveRaf = null;
@@ -822,6 +894,29 @@ function buildFormData() {
   return fd;
 }
 
+/* 把这一刻的完整参数快照下来。
+   以前 lastMeta 只有几个耗时数字，导致「载入历史」后 curl 还是用当前表单的值拼，
+   复现出来完全不是同一条音频。这里连参考音频本体一起存，历史条目才真正自洽。 */
+function captureMeta(extra = {}) {
+  const ins = $("instruction").value.trim();
+  return Object.assign({
+    mode: state.mode,
+    instruction: ins,
+    cfg: effectiveCfg(),
+    seed: parseInt($("seed").value, 10) || 42,
+    text: $("text").value.trim(),
+    texts: null,
+    endpoint: "/v1/audio/speech",
+    locked: false,
+    batch: false,
+    refBlob: state.refBlob,
+    refName: state.refBlob ? (state.refName || "reference.wav") : "",
+    refText: state.refBlob ? $("ref-text").value.trim() : "",
+    voice: state.currentVoice || "",
+    createdAt: new Date().toISOString(),
+  }, extra);
+}
+
 function validate() {
   const t = $("text").value.trim();
   if (!t) { toast("请先输入要合成的文本", "err"); return false; }
@@ -942,7 +1037,11 @@ async function generate(opts = {}) {
 
     const total = performance.now() - t0;
     const dur = state.buffer.length / state.sampleRate;
-    state.lastMeta = { seed: seedUsed, ttfa, total, dur, cfg: effectiveCfg(), mode: state.mode, text: $("text").value.trim() };
+    state.lastMeta = captureMeta({
+      endpoint: "/v1/audio/speech", locked: false, batch: false,
+      seed: seedUsed, ttfa, total, dur, cfg: effectiveCfg(),
+      text: $("text").value.trim(), texts: null,
+    });
 
     $("s-total").textContent = fmtMs(total);
     $("s-dur").textContent = fmtDur(dur);
@@ -959,6 +1058,7 @@ async function generate(opts = {}) {
 
     enableOutput(true);
     addHistory(state.buffer, state.sampleRate, state.lastMeta);
+    recordLog(state.lastMeta, state.buffer, state.sampleRate, { ok: true });
     log(`完成：${dur.toFixed(2)}s 音频 · 首包 ${fmtMs(ttfa)} · 总计 ${fmtMs(total)} · RTF ${(total / 1000 / dur).toFixed(2)}`, "s");
   } catch (e) {
     if (e.name === "AbortError") {
@@ -967,6 +1067,7 @@ async function generate(opts = {}) {
       log("失败：" + e.message, "e");
       toast(e.message, "err");
       $("out-badge").textContent = "失败";
+      recordLog(captureMeta({ endpoint: "/v1/audio/speech", locked: false, batch: false }), null, 24000, { ok: false, error: e.message });
     }
   } finally {
     state.busy = false;
@@ -1031,11 +1132,39 @@ async function generateBatch(lines) {
     });
     $("batch-card").classList.remove("hidden");
     $("batch-badge").textContent = `${sizes.length} 条 · ${fmtMs(total)}`;
+
+    // 批量也进历史（合成一条完整波形 + 记录各分段文本）
+    const mergedLen = all.length / 2;
+    const merged = new Float32Array(mergedLen);
+    {
+      const dv = new DataView(all.buffer, all.byteOffset, all.byteLength);
+      for (let k = 0; k < mergedLen; k++) merged[k] = dv.getInt16(k * 2, true) / 32768;
+    }
+    state.buffer = merged;
+    state.sampleRate = sr;
+    const mdur = mergedLen / sr;
+    state.lastMeta = captureMeta({
+      endpoint: "/v1/audio/speech/batch", locked: true, batch: true,
+      seed: parseInt($("seed").value, 10) || 42, ttfa: null, total, dur: mdur,
+      text: lines.join("\n"), texts: lines.slice(),
+    });
+    $("s-ttfa").textContent = "—";
+    $("s-total").textContent = fmtMs(total);
+    $("s-dur").textContent = fmtDur(mdur);
+    $("s-rtf").textContent = mdur > 0 ? (total / 1000 / mdur).toFixed(2) : "—";
+    $("s-seed").textContent = state.lastMeta.seed;
+    $("out-badge").textContent = "完成（可复现）";
+    drawWave(state.buffer);
+    enableOutput(true);
+    addHistory(state.buffer, sr, state.lastMeta);
+    recordLog(state.lastMeta, state.buffer, state.sampleRate, { ok: true });
+
     log(`批量完成：${sizes.length} 条 · 总计 ${fmtMs(total)}`, "s");
     toast("批量生成完成", "ok");
   } catch (e) {
     log("批量失败：" + e.message, "e");
     toast(e.message, "err");
+    recordLog(captureMeta({ endpoint: "/v1/audio/speech/batch", locked: true, batch: true }), null, 24000, { ok: false, error: e.message });
   } finally {
     state.busy = false;
     setBusyUI(false);
@@ -1095,10 +1224,12 @@ async function generateLocked(texts) {
     state.buffer = merged;
     state.sampleRate = sr;
     const dur = len / sr;
-    state.lastMeta = {
-      seed: seedUsed, ttfa: null, total, dur, cfg: effectiveCfg(),
-      mode: state.mode, text: $("text").value.trim(), locked: true,
-    };
+    state.lastMeta = captureMeta({
+      endpoint: "/v1/audio/speech/batch", locked: true, batch: texts.length > 1,
+      seed: seedUsed, ttfa: null, total, dur,
+      text: texts.length === 1 ? texts[0] : texts.join("\n"),
+      texts: texts.slice(),
+    });
 
     $("s-ttfa").textContent = "—";
     $("s-total").textContent = fmtMs(total);
@@ -1140,11 +1271,13 @@ async function generateLocked(texts) {
     }
 
     log(`完成：${dur.toFixed(2)}s · 总计 ${fmtMs(total)} · RTF ${(total / 1000 / dur).toFixed(2)} · 可复现`, "s");
+    recordLog(state.lastMeta, state.buffer, state.sampleRate, { ok: true });
     toast("生成完成（可复现）", "ok");
   } catch (e) {
     log("失败：" + e.message, "e");
     toast(e.message, "err");
     $("out-badge").textContent = "失败";
+    recordLog(captureMeta({ endpoint: "/v1/audio/speech/batch", locked: true, batch: texts.length > 1, texts: texts.slice() }), null, 24000, { ok: false, error: e.message });
   } finally {
     state.busy = false;
     setBusyUI(false);
@@ -1194,15 +1327,18 @@ function playBuffer() {
   const url = URL.createObjectURL(blob);
   const a = new Audio(url);
   state.audio = a;
-  a.onended = () => { URL.revokeObjectURL(url); state.playing = false; };
+  a.onended = () => { URL.revokeObjectURL(url); state.playing = false; stopPlayhead(); drawWave(state.buffer); };
   a.play();
   state.playing = true;
+  // 用 <audio> 元素的 currentTime 驱动波形进度；duration 就绪前按缓冲长度兜底
+  startPlayhead(() => (a.duration ? a.currentTime / a.duration : -1), state.buffer.length / state.sampleRate);
   log("播放", "");
 }
 
 function pausePlayback() {
   resetPlayback();
   try { if (state.audio) state.audio.pause(); } catch (e) {}
+  if (state.buffer) drawWave(state.buffer);
   log("已停止播放", "");
 }
 
@@ -1243,20 +1379,56 @@ async function saveToServer() {
   }
 }
 
+/* 生成可复现的 curl 命令。
+   全部参数都取自 lastMeta（这条音频自己的快照），不再读当前表单，
+   否则「载入历史」之后拼出来的命令和这条音频对不上。 */
+function curlFor(meta) {
+  const host = location.hostname || "127.0.0.1";
+  const port = location.port || "7860";
+  const base = `http://${host}:${port}`;
+  const q = (s) => String(s == null ? "" : s);
+  const lines = [];
+
+  if (meta.locked || meta.endpoint === "/v1/audio/speech/batch") {
+    const texts = meta.texts && meta.texts.length ? meta.texts : [meta.text || ""];
+    lines.push(`curl -X POST ${base}/v1/audio/speech/batch \\`);
+    lines.push(`  -F 'texts=${q(JSON.stringify(texts)).replace(/'/g, "'\\''")}' \\`);
+    if (meta.instruction) lines.push(`  -F 'instruction=${q(meta.instruction).replace(/'/g, "'\\''")}' \\`);
+    lines.push(`  -F 'cfg_scale=${q(meta.cfg)}' \\`);
+    lines.push(`  -F 'seed=${q(meta.seed)}' \\`);
+    if (meta.refName) {
+      lines.push(`  -F 'ref_audio=@${q(meta.refName)}' \\`);
+      lines.push(`  -F 'ref_text=${q(meta.refText).replace(/'/g, "'\\''")}' \\`);
+    }
+    lines.push(`  --output out.pcm`);
+    lines.push(`# 24kHz s16le 单声道裸 PCM，用下面这条转成 WAV：`);
+    lines.push(`# ffmpeg -f s16le -ar 24000 -ac 1 -i out.pcm out.wav`);
+  } else {
+    lines.push(`curl -X POST ${base}/v1/audio/speech \\`);
+    lines.push(`  -F 'text=${q(meta.text).replace(/'/g, "'\\''")}' \\`);
+    if (meta.instruction) lines.push(`  -F 'instruction=${q(meta.instruction).replace(/'/g, "'\\''")}' \\`);
+    lines.push(`  -F 'cfg_scale=${q(meta.cfg)}' \\`);
+    lines.push(`  -F 'seed=${q(meta.seed)}' \\`);
+    if (meta.refName) {
+      lines.push(`  -F 'ref_audio=@${q(meta.refName)}' \\`);
+      lines.push(`  -F 'ref_text=${q(meta.refText).replace(/'/g, "'\\''")}' \\`);
+    }
+    lines.push(`  --output out.pcm`);
+    lines.push(`# 注意：流式接口有额外随机性，同参数无法逐字节复现；`);
+    lines.push(`# 要完全可复现请勾选「🔒 确定性复刻」走 /batch。`);
+  }
+  return lines.join("\n");
+}
+
 function copyCurl() {
   const m = state.lastMeta;
-  if (!m) return;
-  const ins = $("instruction").value.trim();
-  const t = $("text").value.trim().replace(/"/g, '\\"');
-  let cmd = `curl -X POST http://127.0.0.1:${location.port || 80}/v1/audio/speech \\\n` +
-    `  -F "text=${t}" \\\n` +
-    `  -F "cfg_scale=${m.cfg}" \\\n` +
-    `  -F "seed=${m.seed}"`;
-  if (ins) cmd += ` \\\n  -F "instruction=${ins.replace(/"/g, '\\"')}"`;
-  if (state.refBlob) cmd += ` \\\n  -F "ref_audio=@${state.refName}" \\\n  -F "ref_text=${$("ref-text").value.trim().replace(/"/g, '\\"')}"`;
-  cmd += ` \\\n  --output out.pcm`;
+  if (!m) { toast("还没有可复现的生成记录", "err"); return; }
+  const cmd = curlFor(m);
   navigator.clipboard.writeText(cmd).then(
-    () => { toast("curl 命令已复制到剪贴板", "ok"); log("已复制 curl 命令", "s"); },
+    () => {
+      toast(m.locked ? "curl 已复制（可逐字节复现）" : "curl 已复制（流式，可能有微小差异）", "ok");
+      log(`已复制 curl 命令 · ${m.locked ? "确定性" : "流式"} · seed ${m.seed}`, "s");
+    },
     () => { log(cmd, "i"); toast("复制失败，命令已写入日志", "err"); }
   );
 }
@@ -1264,6 +1436,59 @@ function copyCurl() {
 function regenWithNewSeed() {
   $("seed").value = Math.floor(Math.random() * 1000000);
   generate();
+}
+
+/* 从一条历史/日志记录还原完整现场：
+   文本、音色描述、CFG、种子、模式、参考音频（含参考文本）全部回填，
+   这样「换种子重生成」「复制 curl」「保存到服务器」都针对这条音频本身。 */
+async function restoreMeta(m, { announce = true } = {}) {
+  if (!m) return;
+  setMode(m.mode || "design");
+
+  if (m.refName) {
+    let blob = m.refBlob || null;
+    // 刷新过页面的话内存里没有 blob，从归档里取回来
+    if (!blob && m.genId) {
+      try {
+        const r = await fetch(`/api/history/${m.genId}/ref`);
+        if (r.ok) blob = await r.blob();
+      } catch (e) {}
+    }
+    if (blob) {
+      await setReference(blob, m.refName, m.refDur || 0);
+      $("ref-text").value = m.refText || "";
+    } else {
+      clearReference();
+      $("ref-text").value = "";
+      log(`记录 ${m.genId || ""} 的参考音频已不在归档里，无法自动回填`, "w");
+    }
+  } else {
+    clearReference();
+  }
+
+  $("instruction").value = m.instruction || "";
+  // CFG 滑块范围 1~10，历史里可能存在越界值
+  $("cfg").value = String(Math.min(10, Math.max(1, Number(m.cfg) || 1)));
+  $("seed").value = String(m.seed == null ? 42 : m.seed);
+  $("lock-mode").checked = !!m.locked;
+  state.lock = !!m.locked;
+  syncCfg();
+  // 载入历史时侧边数据直接改成这条音频的生成数据（用户要求：不再保留表单里的旧值）
+  if (m.text != null) {
+    $("text").value = m.text;
+    $("text").dispatchEvent(new Event("input"));
+  }
+  if (m.texts && m.texts.length > 1) {
+    $("text").value = m.texts.join("\n");
+    $("text").dispatchEvent(new Event("input"));
+  }
+  $("char-badge").textContent = $("text").value.length + " 字";
+
+  if (announce) {
+    toast(`已还原这条音频的生成参数`, "ok");
+    log(`已还原：${m.mode} · ${m.locked ? "确定性" : "流式"} · cfg ${m.cfg} · seed ${m.seed}` +
+      (m.refName ? ` · 参考 ${m.refName}` : ""), "s");
+  }
 }
 
 /* ============================================================
@@ -1279,6 +1504,121 @@ function addHistory(samples, sr, meta) {
   state.history.unshift(item);
   if (state.history.length > 30) state.history.pop();
   renderHistory();
+  loadServerHistory();
+}
+
+/* 服务端历史（刷新页面后还在，来自 logs\manifest.jsonl）。
+   和内存历史分开存：内存里的带音频采样可离线重放，服务端的只带归档 URL。 */
+async function loadServerHistory() {
+  try {
+    const r = await fetch("/api/history?limit=40", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    state.serverHistory = j.items || [];
+    state.serverSession = j.session || "";
+    renderServerHistory();
+  } catch (e) {
+    log("读取历史记录失败：" + e.message, "w");
+  }
+}
+
+function renderServerHistory() {
+  const el = $("srv-history");
+  if (!el) return;
+  const items = state.serverHistory || [];
+  $("srv-badge").textContent = items.length;
+  if (!items.length) {
+    el.innerHTML = '<div class="hint" style="padding:8px">本次以及之前每一次生成都会记录在这里（logs\\ 目录），刷新页面不会丢。</div>';
+    return;
+  }
+  el.innerHTML = "";
+  items.forEach((it) => {
+    const div = document.createElement("div");
+    div.className = "hist-item" + (state.lastMeta && state.lastMeta.genId === it.id ? " on" : "");
+    const texts = (it.texts && it.texts.length ? it.texts : [it.text || ""]).filter(Boolean);
+    const first = texts[0] || "（无文本）";
+    const more = texts.length > 1 ? ` +${texts.length - 1}` : "";
+    const tag = it.locked ? "🔒" : "〰";
+    const okMark = it.ok ? "" : " <span style='color:var(--err)'>失败</span>";
+    div.innerHTML = `
+      <span class="mono" style="color:var(--fg3);padding-top:2px">${tag}</span>
+      <div class="txt">
+        <div class="t" title="${escapeHtml(texts.join("\n"))}">${escapeHtml(first.slice(0, 54))}${first.length > 54 ? "…" : ""}${more}${okMark}</div>
+        <div class="m">${(it.dur || 0).toFixed(2)}s · cfg ${it.cfg} · seed ${it.seed} · ${it.mode} · ${it.createdAt}</div>
+      </div>
+      <div class="acts">
+        <button data-a="play" title="播放归档音频">▶</button>
+        <button data-a="load" title="还原这条音频的生成参数">↺</button>
+        <button data-a="curl" title="复制可复现的 curl">⧉</button>
+        <button data-a="dl" title="下载">⬇</button>
+      </div>`;
+    div.querySelector('[data-a="play"]').onclick = () => {
+      if (!it.hasWav) { toast("这条记录没有归档音频", "err"); return; }
+      new Audio(`/api/history/${it.id}/wav?t=${Date.now()}`).play()
+        .catch(() => toast("播放失败", "err"));
+    };
+    div.querySelector('[data-a="load"]').onclick = () => loadServerItem(it);
+    div.querySelector('[data-a="curl"]').onclick = () => {
+      const cmd = curlFor({
+        locked: it.locked, endpoint: it.endpoint, text: it.text, texts: it.texts,
+        instruction: it.instruction, cfg: it.cfg, seed: it.seed,
+        refName: it.refName, refText: it.refText,
+      });
+      navigator.clipboard.writeText(cmd).then(
+        () => toast("curl 已复制", "ok"),
+        () => { log(cmd, "i"); toast("复制失败，已写入日志", "err"); }
+      );
+    };
+    div.querySelector('[data-a="dl"]').onclick = () => {
+      if (!it.hasWav) { toast("这条记录没有归档音频", "err"); return; }
+      const a = document.createElement("a");
+      a.href = `/api/history/${it.id}/wav`;
+      a.download = `breeze_${it.id}.wav`;
+      a.click();
+    };
+    el.appendChild(div);
+  });
+}
+
+/* 载入一条服务端记录：把音频拉回来放进播放器，同时还原全部生成参数 */
+async function loadServerItem(it) {
+  try {
+    if (it.hasWav) {
+      const r = await fetch(`/api/history/${it.id}/wav`);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const raw = await r.arrayBuffer();
+      const wav = await audioCtx().decodeAudioData(raw.slice(0));
+      const mono = new Float32Array(wav.length);
+      for (let c = 0; c < wav.numberOfChannels; c++) {
+        const d = wav.getChannelData(c);
+        for (let i = 0; i < wav.length; i++) mono[i] += d[i] / wav.numberOfChannels;
+      }
+      state.buffer = mono;
+      state.sampleRate = wav.sampleRate;
+      drawWave(state.buffer);
+      enableOutput(true);
+    }
+    const meta = {
+      mode: it.mode, instruction: it.instruction, cfg: it.cfg, seed: it.seed,
+      text: it.text, texts: it.texts, endpoint: it.endpoint, locked: it.locked,
+      batch: it.batch, refName: it.refName, refText: it.refText,
+      dur: it.dur, total: it.total, ttfa: it.ttfa >= 0 ? it.ttfa : null,
+      genId: it.id, createdAt: it.createdAt,
+    };
+    state.lastMeta = meta;
+    $("s-ttfa").textContent = fmtMs(meta.ttfa);
+    $("s-total").textContent = fmtMs(meta.total);
+    $("s-dur").textContent = fmtDur(meta.dur);
+    $("s-rtf").textContent = meta.dur > 0 ? (meta.total / 1000 / meta.dur).toFixed(2) : "—";
+    $("s-seed").textContent = meta.seed;
+    await restoreMeta(meta, { announce: false });
+    renderServerHistory();
+    toast("已载入并还原参数", "ok");
+    log(`已载入记录 ${it.id} · cfg ${it.cfg} · seed ${it.seed}${it.refName ? " · 参考 " + it.refName : ""}`, "s");
+  } catch (e) {
+    toast("载入失败：" + e.message, "err");
+    log("载入失败：" + e.message, "e");
+  }
 }
 
 function renderHistory() {
@@ -1293,18 +1633,20 @@ function renderHistory() {
     const div = document.createElement("div");
     div.className = "hist-item";
     const m = h.meta;
+    const head = (m.text || (m.texts ? m.texts.join(" / ") : "")).slice(0, 60);
+    const look = m.locked ? "🔒" : "〰";
     div.innerHTML = `
-      <span class="mono" style="color:var(--fg3);padding-top:2px">${i + 1}</span>
+      <span class="mono" style="color:var(--fg3);padding-top:2px">${look}${i + 1}</span>
       <div class="txt">
-        <div class="t" title="${escapeHtml(m.text)}">${escapeHtml(m.text.slice(0, 60))}${m.text.length > 60 ? "…" : ""}</div>
-        <div class="m">${m.dur.toFixed(2)}s · 首包 ${fmtMs(m.ttfa)} · cfg ${m.cfg} · seed ${m.seed} · ${m.mode}</div>
+        <div class="t" title="${escapeHtml(m.text || "")}">${escapeHtml(head)}${(m.text || "").length > 60 ? "…" : ""}</div>
+        <div class="m">${(m.dur || 0).toFixed(2)}s · 首包 ${fmtMs(m.ttfa)} · cfg ${m.cfg} · seed ${m.seed} · ${m.mode}</div>
       </div>
       <div class="acts">
-        <button title="载入到播放器">↺</button>
-        <button title="下载">⬇</button>
+        <button data-a="load" title="载入到播放器并还原参数">↺</button>
+        <button data-a="curl" title="复制这条的 curl">⧉</button>
+        <button data-a="dl" title="下载">⬇</button>
       </div>`;
-    const [bLoad, bDl] = div.querySelectorAll("button");
-    bLoad.onclick = () => {
+    div.querySelector('[data-a="load"]').onclick = async () => {
       state.buffer = h.samples.slice(0);
       state.sampleRate = h.sr;
       state.lastMeta = h.meta;
@@ -1315,9 +1657,16 @@ function renderHistory() {
       $("s-seed").textContent = m.seed;
       drawWave(state.buffer);
       enableOutput(true);
-      toast("已载入", "ok");
+      // 关键：连文本、音色描述、CFG、参考音频一起回填，之后 regenerate / curl 才对得上
+      await restoreMeta(m);
     };
-    bDl.onclick = () => {
+    div.querySelector('[data-a="curl"]').onclick = () => {
+      navigator.clipboard.writeText(curlFor(m)).then(
+        () => toast("curl 已复制", "ok"),
+        () => { log(curlFor(m), "i"); toast("复制失败，已写入日志", "err"); }
+      );
+    };
+    div.querySelector('[data-a="dl"]').onclick = () => {
       const blob = floatToWavBlob(h.samples, h.sr);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
@@ -1437,6 +1786,7 @@ function bind() {
   $("btn-curl").onclick = copyCurl;
   $("btn-regen").onclick = regenWithNewSeed;
   $("btn-clear-hist").onclick = () => { state.history = []; renderHistory(); };
+  $("btn-srv-refresh").onclick = () => { loadServerHistory(); toast("已刷新服务端记录", "ok"); };
 
   // 快捷键
   document.addEventListener("keydown", (e) => {
@@ -1602,6 +1952,46 @@ async function saveCurrentVoice() {
   }
 }
 
+/* 把一次生成写进服务端日志（logs\session_*.log + logs\manifest.jsonl），
+   并把音频与参考音频归档到 outputs\gen\，刷新页面后仍然能查到、能重放。 */
+async function recordLog(meta, samples, sr, { ok = true, error = "" } = {}) {
+  try {
+    const fd = new FormData();
+    fd.append("mode", meta.mode || state.mode);
+    fd.append("endpoint", meta.endpoint || "/v1/audio/speech");
+    fd.append("locked", meta.locked ? "1" : "0");
+    fd.append("batch", meta.batch ? "1" : "0");
+    fd.append("ok", ok ? "1" : "0");
+    if (error) fd.append("error", String(error).slice(0, 500));
+    fd.append("text", meta.text || "");
+    if (meta.texts && meta.texts.length) fd.append("texts", JSON.stringify(meta.texts));
+    fd.append("instruction", meta.instruction || "");
+    fd.append("cfg", String(meta.cfg ?? 1));
+    fd.append("seed", String(meta.seed ?? 42));
+    fd.append("refName", meta.refName || "");
+    fd.append("refText", meta.refText || "");
+    fd.append("voice", meta.voice || "");
+    if (meta.ttfa != null) fd.append("ttfa", String(meta.ttfa));
+    fd.append("total", String(meta.total ?? 0));
+    fd.append("dur", String(meta.dur ?? 0));
+    fd.append("sampleRate", String(sr || 24000));
+    if (samples && samples.length) {
+      fd.append("wav", floatToWavBlob(samples, sr || 24000), "gen.wav");
+    }
+    if (meta.refBlob) fd.append("ref", meta.refBlob, meta.refName || "ref.wav");
+
+    const r = await fetch("/api/log", { method: "POST", body: fd });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (state.lastMeta) state.lastMeta.genId = j.id;
+    log(`已记录 ${j.id}`, "");
+    return j.id;
+  } catch (e) {
+    log("记录失败：" + e.message, "w");
+    return null;
+  }
+}
+
 function insertAtCursor(el, text) {
   const start = el.selectionStart, end = el.selectionEnd;
   const v = el.value;
@@ -1623,6 +2013,7 @@ function insertAtCursor(el, text) {
   log("Breeze TTS 2 本地控制台已就绪", "i");
   log("接口：POST /v1/audio/speech · 返回裸 PCM（s16le，24kHz 单声道）", "");
   await loadVoices();
+  await loadServerHistory();
   const ok = await pollStatus();
   if (!ok) {
     log("模型还在加载，每 3 秒重试一次…", "w");

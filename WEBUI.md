@@ -27,10 +27,11 @@
 | 副语言事件 | `[笑]` `[叹气]` `[咳嗽]` `[清嗓子]` `[喘气]` `[哭]` `[开心]` 等一键插入光标处 |
 | 参考音频 | 拖拽、文件选择、**浏览器内直接录音**（自动转 WAV），可试听、可清除 |
 | 流式播放 | Web Audio API 边下发边播，首包即可发声，无爆音 |
-| 波形与统计 | 实时波形、TTFA、总耗时、音频时长、RTF、seed |
+| 波形与统计 | 实时波形 + **播放进度高亮**、TTFA、总耗时、音频时长、RTF、seed |
 | 批量合成 | 每行一条文本，一次请求出多条，逐条试听/下载 |
 | 音色库 | 把「描述 + 参考音频 + cfg + seed + 试听样本」存成可复用音色，一键套用 |
 | 确定性复刻 | 勾选后所有生成走 `/batch`，**同参数逐字节可复现** |
+| 生成记录 | 每次生成自动落盘 `logs/`（人读日志 + JSONL），刷新/重启都不丢，可一键还原全部参数 |
 | 结果处理 | 播放、换 seed 重生、落盘到 `outputs/`、下载 WAV、复制可复现的 curl 命令、历史记录 |
 
 ## 2. 目录结构
@@ -43,12 +44,13 @@
 ├─ tests/  docker/  configs/  assets/   上游
 ├─ webui/                   ★ 本分支新增
 │  ├─ index.html            单文件前端
-│  └─ server.py             在官方 app 上挂载页面 / 保存接口 / 音色库接口
+│  └─ server.py             在官方 app 上挂载页面 / 保存接口 / 音色库接口 / 生成记录接口
 ├─ start-webui.bat          ★ Windows 一键启动（网页控制台）
 ├─ start-api.bat            ★ Windows 一键启动（仅 REST）
 ├─ WEBUI.md                 ★ 本文档
 ├─ checkpoints/             模型权重（.gitignore，需自行下载）
 ├─ voices/                  音色库数据（.gitignore，个人数据）
+├─ logs/                    生成记录（.gitignore，含本机文本）
 └─ outputs/                 生成结果（.gitignore）
 ```
 
@@ -115,8 +117,23 @@ Windows 下可直接双击 `start-webui.bat` / `start-api.bat`（脚本用 `%~dp
 | DELETE | `/api/voices/{id}` | 删除音色及其 ref/sample 文件 |
 | GET | `/api/voices/{id}/ref` | 取回该音色的参考音频 |
 | GET | `/api/voices/{id}/sample` | 取回该音色的试听样本 |
+| GET | `/api/session` | 当前会话日志与记录文件路径 |
+| POST | `/api/log` | 记录一次生成（参数 + 可选 wav/ref 归档） |
+| GET | `/api/history?limit=` | 读取生成记录（新的在前，可按 session 过滤） |
+| GET | `/api/history/{id}/wav` | 取回该次生成的归档音频 |
+| GET | `/api/history/{id}/ref` | 取回该次生成所用参考音频 |
 
 这些路由都带 `include_in_schema=False`，不会污染 `/docs`。
+
+### 生成记录
+
+每次生成（成功或失败）都会写：
+
+- `logs/session_YYYY-MM-DD_HHMMSS.log` —— 人读日志，主行含 seed/cfg/时长/耗时/sha256，另附文本、音色描述、参考音频。
+- `logs/manifest.jsonl` —— 一行一条 JSON：`mode / endpoint / locked / text / texts / instruction / cfg / seed / refName / refText / ttfa / total / dur / rtf / wavSha256 / wavBytes / session`。
+- `outputs/gen/{id}.wav`、`outputs/gen/{id}_ref.wav` —— 归档音频，供页面「服务端记录」播放与还原。
+
+页面里的「服务端记录」读 manifest，刷新页面、重启服务都不会丢；点 `↺` 会把那一条的文本、音色描述、CFG、种子、模式和参考音频全部回填，再生成一次即可比对 sha256 验证是否逐字节复现。
 
 ## 6. 两个关键坑（重要）
 

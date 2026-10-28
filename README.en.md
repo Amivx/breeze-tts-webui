@@ -242,7 +242,7 @@ Upstream code is untouched; this fork mounts an extra web UI and voice-library A
 python -m webui.server checkpoints/Breeze-TTS-2 --host 127.0.0.1 --port 7860
 ```
 
-Open <http://127.0.0.1:7860/> — single file, no CDN, works offline. It provides the three modes (design / clone / direction), voice presets, inline vocal events, reference audio by drag-drop or in-browser recording, streaming playback, waveform and RTF stats, batch synthesis, a reusable voice library, and a deterministic-replication switch.
+Open <http://127.0.0.1:7860/> — single file, no CDN, works offline. It provides the three modes (design / clone / direction), voice presets, inline vocal events, reference audio by drag-drop or in-browser recording, streaming playback with a moving waveform playhead, RTF stats, batch synthesis, a reusable voice library, a deterministic-replication switch, and automatic generation logs (`logs/session_*.log` plus `logs/manifest.jsonl`) from which any past result can be restored parameter-by-parameter.
 
 > [!IMPORTANT]
 > **Only `/v1/audio/speech/batch` is reproducible.** The streaming endpoint produces a different SHA256 on every call even with identical parameters, while `/batch` is bit-for-bit identical and honours `seed`. To keep a voice long-term, use the console's "🔒 deterministic replication" switch plus the voice library. Details and measurements: **[WEBUI.md](WEBUI.md)** (Chinese).
