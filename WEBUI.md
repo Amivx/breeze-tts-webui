@@ -11,6 +11,10 @@
 本仓库是 [breezeblue-ai/breeze-tts](https://github.com/breezeblue-ai/breeze-tts) 的**本地化增强分支**：
 上游代码（`breeze_infer/`、`models/`、`tests/`、`docker/`）一行未改，只在其 FastAPI 实例上**额外挂载**了一套网页控制台与音色库接口。
 
+![网页控制台](docs/webui.png)
+
+> 上图即默认界面：左侧是合成模式、音色描述、我的音色与生成参数，右侧是文本、波形与统计、生成历史、服务端记录和运行日志。
+
 - 上游源码：https://github.com/breezeblue-ai/breeze-tts
 - 模型权重：https://huggingface.co/BreezeBlue/Breeze-TTS-2 （需单独下载，仓库不含权重）
 - 许可证：源码 Apache-2.0；**权重与生成结果仅限研究/非商业用途**，见下方「许可」
